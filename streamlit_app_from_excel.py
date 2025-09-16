@@ -1,5 +1,5 @@
 import math
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -17,10 +17,14 @@ st.set_page_config(page_title=APP_TITLE, layout="centered")
 st.title(APP_TITLE)
 st.caption("Excel-driven prototype: reads Weather & Savings Lookup, filters by keys, and linearly interpolates by Hours.")
 
-# Cache reset button (handy after uploading a new workbook to GitHub)
-if st.button("Reload workbook (clear cache)"):
-    st.cache_data.clear()
-    st.experimental_rerun()
+# --- Safe cache-busting token (no experimental rerun needed)
+if "reload_token" not in st.session_state:
+    st.session_state["reload_token"] = 0
+
+col_reload, _ = st.columns([1, 3])
+with col_reload:
+    if st.button("Reload workbook (clear cache)"):
+        st.session_state["reload_token"] += 1
 
 
 # =========================================================
@@ -53,7 +57,6 @@ EXPECTED_CANONICAL = {
         "electric_savings_cooling_and_aux_kwhpersf", "electric savings cooling and aux kwhpersf",
         "electric_savings_kwhpersf_cooling", "kwhpersfcooling", "kwh per sf cooling", "cooling+aux", "coolingandaux"
     ],
-    # We allow either old or new name; the loader will map both
     "Gas_savings_Heat_thermsperSF": [
         "gas_savings_heat_thermspersf", "gas savings heat thermspersf",
         "gas_savings_heat_therms", "gas_savings_thermspersf", "thermspersf", "therms per sf", "gas therms per sf"
@@ -95,10 +98,10 @@ def _map_to_canonical(cols: List[str]) -> Dict[str, str]:
 
 
 # =========================================================
-# Loaders
+# Loaders (accept reload_token so cache invalidates when you click reload)
 # =========================================================
 @st.cache_data(show_spinner=True)
-def load_weather() -> pd.DataFrame:
+def load_weather(reload_token: int) -> pd.DataFrame:
     """Parse Weather Information: repeating 4-col blocks [City, HDD, CDD, State]."""
     ws = pd.read_excel(WORKBOOK_FILENAME, sheet_name=WEATHER_SHEET, header=None)
     recs = []
@@ -122,7 +125,7 @@ def load_weather() -> pd.DataFrame:
     return out
 
 @st.cache_data(show_spinner=True)
-def load_lookup() -> pd.DataFrame:
+def load_lookup(reload_token: int) -> pd.DataFrame:
     """Robust loader for 'Savings Lookup': auto-detect header row; normalize & map to canonical names."""
     # read w/out header to detect header row
     df0 = pd.read_excel(WORKBOOK_FILENAME, sheet_name=LOOKUP_SHEET, header=None)
@@ -146,17 +149,17 @@ def load_lookup() -> pd.DataFrame:
                     df = df.rename(columns={c: canon})
                     break
 
-    # Final cleanup
+    # backward-compat: allow the old gas header name
+    if "Gas_savings_Heat_thermsperSF" not in df.columns and "Gas_savings_Heat_therms" in df.columns:
+        df = df.rename(columns={"Gas_savings_Heat_therms": "Gas_savings_Heat_thermsperSF"})
+
     df = df.dropna(how="all").reset_index(drop=True)
     return df
 
 
-weather_df = load_weather()
-lookup_df  = load_lookup()
-
-# Allow both old/new gas header variants by remapping if needed
-if "Gas_savings_Heat_thermsperSF" not in lookup_df.columns and "Gas_savings_Heat_therms" in lookup_df.columns:
-    lookup_df = lookup_df.rename(columns={"Gas_savings_Heat_therms": "Gas_savings_Heat_thermsperSF"})
+# Load data (cache keyed by reload_token)
+weather_df = load_weather(st.session_state["reload_token"])
+lookup_df  = load_lookup(st.session_state["reload_token"])
 
 # Required canonical columns
 required_cols = [
@@ -333,6 +336,7 @@ if st.button("Calculate Savings", type="primary"):
     e_cool   = float(vals.get("electric_savings_Cooling_and_Aux_kWhperSF", 0) or 0.0)
     g_therms = float(vals.get("Gas_savings_Heat_thermsperSF", 0) or 0.0)
 
+    # per-SF → totals
     kWh    = (e_heat + e_cool) * csw_area
     therms = g_therms * csw_area
     dollars = kWh * elec_rate + therms * gas_rate
@@ -381,4 +385,4 @@ with st.expander("Debug / Inspect"):
     st.dataframe(weather_df.head(20))
     st.write("Lookup rows:", len(lookup_df))
     st.dataframe(lookup_df.head(20))
-    st.caption("If required columns are missing, check the Savings Lookup headers or use the Reload button to clear cache.")
+    st.caption("Click 'Reload workbook' after updating the Excel file in GitHub to clear the cache.")
