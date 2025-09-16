@@ -105,104 +105,84 @@ def _map_to_canonical(cols: List[str]) -> Dict[str, str]:
     return mapping
 
 # =========================================================
-# Loaders (cache keyed by reload_token)
+# WEATHER LOADER — tidy single table with auto header detection
 # =========================================================
 @st.cache_data(show_spinner=True)
 def load_weather(reload_token: int) -> pd.DataFrame:
     """
-    Ultra-robust loader for 'Weather Information'.
-    Finds the real header row anywhere in the sheet (handles merged/blank/title rows), and maps headers:
-      State | City/Cities | Heating Degree Days (HDD) | Cooling Degree Days (CDD)
-    to canonical: State, City, HDD, CDD
+    Reads 'Weather Information' as a single tidy table. Auto-detects the header row and
+    renames columns to canonical: State, City, HDD, CDD.
+    Accepts headers that contain 'State', 'City' or 'Cities', and either 'HDD' or 'Heating...HDD',
+    and either 'CDD' or 'Cooling...CDD'.
     """
-    raw = pd.read_excel(WORKBOOK_FILENAME, sheet_name=WEATHER_SHEET, header=None, dtype=str)
-    # Drop fully empty rows/cols
+    raw = pd.read_excel(WORKBOOK_FILENAME, sheet_name=WEATHER_SHEET, header=None)
     raw = raw.dropna(how="all").dropna(how="all", axis=1).reset_index(drop=True)
 
-    # Normalizer
-    def norm(s):
-        if s is None or (isinstance(s, float) and np.isnan(s)): return ""
-        x = str(s).strip().lower()
+    def norm(s: str) -> str:
+        if s is None: return ""
+        x = str(s).lower()
         for ch in ["\xa0", " ", "_", "-", ",", ".", "/", "\\", "(", ")", "[", "]", ":", ";"]:
             x = x.replace(ch, "")
         return x
 
-    # Score each row by presence of header tokens
-    def header_score(series):
-        tokens = [norm(v) for v in series.fillna("").tolist()]
-        score = 0
-        if any(t.startswith("state") for t in tokens): score += 1
-        if any(t.startswith("city") or t.startswith("cities") for t in tokens): score += 1
-        if any(("heating" in t and "hdd" in t) or t == "hdd" for t in tokens): score += 1
-        if any(("cooling" in t and "cdd" in t) or t == "cdd" for t in tokens): score += 1
-        return score
+    # find header row by token presence
+    def score_row(vals: list[str]) -> int:
+        toks = {norm(v) for v in vals if str(v).strip() != ""}
+        sc = 0
+        if any(t.startswith("state") for t in toks): sc += 1
+        if any(t.startswith("city") or t.startswith("cities") for t in toks): sc += 1
+        if any(("heating" in t and "hdd" in t) or t == "hdd" for t in toks): sc += 1
+        if any(("cooling" in t and "cdd" in t) or t == "cdd" for t in toks): sc += 1
+        return sc
 
-    # Pass 1: look for a row that contains ~3-4 of the tokens
-    scores = raw.apply(header_score, axis=1)
-    if (scores.max() or 0) >= 2:
-        hdr_row = int(scores.idxmax())
-    else:
-        # Pass 2: fallback find row that has both state and city labels
-        hdr_row = None
-        for r in range(min(50, len(raw))):
-            vals = [norm(v) for v in raw.iloc[r].tolist()]
-            if any(v.startswith("state") for v in vals) and (any(v.startswith("city") or v.startswith("cities") for v in vals)):
-                hdr_row = r
-                break
-        if hdr_row is None:
-            hdr_row = 0  # last resort
+    best_row, best_score = 0, -1
+    for r in range(min(30, len(raw))):
+        sc = score_row(raw.iloc[r].fillna("").astype(str).tolist())
+        if sc > best_score:
+            best_row, best_score = r, sc
 
-    # Build a header -> column index map by scanning detected header row
-    header_vals = [str(v).strip() for v in raw.iloc[hdr_row].tolist()]
-    col_map = {"State": None, "City": None, "HDD": None, "CDD": None}
-    for idx, val in enumerate(header_vals):
-        nv = norm(val)
-        lv = val.lower()
-        if col_map["State"] is None and nv.startswith("state"):
-            col_map["State"] = idx
-        elif col_map["City"] is None and (nv.startswith("city") or nv.startswith("cities")):
-            col_map["City"] = idx
-        elif col_map["HDD"] is None and (("heating" in lv and "hdd" in lv) or nv == "hdd"):
-            col_map["HDD"] = idx
-        elif col_map["CDD"] is None and (("cooling" in lv and "cdd" in lv) or nv == "cdd"):
-            col_map["CDD"] = idx
+    df = pd.read_excel(WORKBOOK_FILENAME, sheet_name=WEATHER_SHEET, header=best_row)
+    df = df.dropna(how="all").dropna(how="all", axis=1)
+    df.columns = [str(c).strip() for c in df.columns]
 
-    missing = [k for k, v in col_map.items() if v is None]
+    # rename to canonical
+    rename = {}
+    for c in df.columns:
+        low = c.lower().strip()
+        n = norm(c)
+        if n.startswith("state"):
+            rename[c] = "State"
+        elif n.startswith("city") or n.startswith("cities"):
+            rename[c] = "City"
+        elif ("heating" in low and "hdd" in low) or n == "hdd":
+            rename[c] = "HDD"
+        elif ("cooling" in low and "cdd" in low) or n == "cdd":
+            rename[c] = "CDD"
+    df = df.rename(columns=rename)
+
+    needed = ["State", "City", "HDD", "CDD"]
+    missing = [c for c in needed if c not in df.columns]
     if missing:
         st.error("Weather sheet appears to be missing expected columns.")
-        with st.expander("Show detected Weather debug"):
-            st.write("Detected header row index:", hdr_row)
-            st.write("Header row values:", header_vals)
-            st.write("Column map so far:", col_map)
+        with st.expander("Show detected Weather headers"):
+            st.write(list(df.columns))
+            st.write(f"Detected header row index: {best_row}")
         raise ValueError(f"Weather sheet is missing columns: {', '.join(missing)}")
 
-    # Slice the data block underneath the header row
-    data = raw.iloc[hdr_row + 1:].reset_index(drop=True)
+    # clean types
+    df = df[needed].copy()
+    df["State"] = df["State"].astype(str).str.strip()
+    df["City"]  = df["City"].astype(str).str.strip()
+    df["HDD"]   = pd.to_numeric(df["HDD"], errors="coerce")
+    df["CDD"]   = pd.to_numeric(df["CDD"], errors="coerce")
 
-    # Extract columns safely (coerce missing to empty string)
-    def safe_col(ix):
-        return data.iloc[:, ix] if (ix is not None and ix < data.shape[1]) else pd.Series([""] * len(data))
+    df = df.dropna(subset=["State","City","HDD","CDD"]).drop_duplicates()
+    df = df.sort_values(["State","City"]).reset_index(drop=True)
+    return df
 
-    out = pd.DataFrame({
-        "State": safe_col(col_map["State"]),
-        "City":  safe_col(col_map["City"]),
-        "HDD":   safe_col(col_map["HDD"]),
-        "CDD":   safe_col(col_map["CDD"]),
-    })
-
-    # Clean types
-    out["State"] = out["State"].astype(str).str.strip()
-    out["City"]  = out["City"].astype(str).str.strip()
-    out["HDD"]   = pd.to_numeric(out["HDD"], errors="coerce").astype("Int64")
-    out["CDD"]   = pd.to_numeric(out["CDD"], errors="coerce").astype("Int64")
-
-    # Drop blank/incomplete rows, dedupe, sort
-    out = out.dropna(subset=["State", "City", "HDD", "CDD"]).drop_duplicates()
-    out = out[out["State"].astype(str).str.len() > 0]
-    out = out[out["City"].astype(str).str.len() > 0]
-    out = out.sort_values(["State", "City"]).reset_index(drop=True)
-    return out
-
+# =========================================================
+# LOOKUP LOADER
+# =========================================================
 @st.cache_data(show_spinner=True)
 def load_lookup(reload_token: int) -> pd.DataFrame:
     """Robust loader for 'Savings Lookup': auto-detect header row; normalize & map to canonical names."""
@@ -233,6 +213,7 @@ def load_lookup(reload_token: int) -> pd.DataFrame:
     df = df.dropna(how="all").reset_index(drop=True)
     return df
 
+# Load data
 weather_df = load_weather(st.session_state.reload_token)
 lookup_df  = load_lookup(st.session_state.reload_token)
 
@@ -307,8 +288,8 @@ sel = cities_df[cities_df["City"].astype(str).str.strip() == st.session_state.ci
 if sel.empty:
     st.error("Selected location not found in Weather Information.")
     st.stop()
-HDD = int(sel["HDD"].iloc[0]); CDD = int(sel["CDD"].iloc[0])
-st.info(f"HDD = **{HDD}**, CDD = **{CDD}** (from Weather Information)")
+HDD = float(sel["HDD"].iloc[0]); CDD = float(sel["CDD"].iloc[0])
+st.info(f"HDD = **{HDD:,.0f}**, CDD = **{CDD:,.0f}** (from Weather Information)")
 
 # =========================================================
 # WIZARD — Step 3: Building & Systems
@@ -464,11 +445,11 @@ if st.button("Calculate Savings", type="primary"):
         if "CSW_EUI_kBtuperSFperyr" in vals and pd.notnull(vals["CSW_EUI_kBtuperSFperyr"]):
             extras.append(("CSW EUI", f"{float(vals['CSW_EUI_kBtuperSFperyr']):,.2f} kBtu/sf-yr"))
         if "Clg_Load_reduced_BtuhperSF" in vals and pd.notnull(vals["Clg_Load_reduced_BtuhperSF"]):
-            extras.append(("Cooling Load Reduced", f"{float(vals['Clg_Load_reduced_BtuhperSF']):,.0f} Btuh/sf"))
+            extras.append(("Cooling Load Reduced", f"{float(vals['Clg_Load_reduced_BtuhperSF"]):,.0f} Btuh/sf"))
         if "htg_load_reduced_BtuhperSF" in vals and pd.notnull(vals["htg_load_reduced_BtuhperSF"]):
-            extras.append(("Heating Load Reduced", f"{float(vals['htg_load_reduced_BtuhperSF']):,.0f} Btuh/sf"))
+            extras.append(("Heating Load Reduced", f"{float(vals['htg_load_reduced_BtuhperSF"]):,.0f} Btuh/sf"))
         if "baseline_peak_cooling_BtuhperSF" in vals and pd.notnull(vals["baseline_peak_cooling_BtuhperSF"]):
-            extras.append(("Baseline Peak Cooling", f"{float(vals['baseline_peak_cooling_BtuhperSF']):,.0f} Btuh/sf"))
+            extras.append(("Baseline Peak Cooling", f"{float(vals['baseline_peak_cooling_BtuhperSF"]):,.0f} Btuh/sf"))
 
         if extras:
             st.markdown("#### Additional Metrics")
@@ -494,6 +475,7 @@ with st.expander("Debug / Inspect"):
     st.write("Weather rows:", len(weather_df))
     st.dataframe(weather_df.head(30))
     st.write("Unique states:", len(weather_df["State"].unique()))
-    st.write(weather_df.groupby("State")["City"].nunique().sort_values(ascending=False).head(20))
+    if not weather_df.empty:
+        st.write(weather_df.groupby("State")["City"].nunique().sort_values(ascending=False).head(20))
     st.write("Lookup rows:", len(lookup_df))
     st.dataframe(lookup_df.head(20))
