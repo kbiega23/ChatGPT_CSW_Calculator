@@ -21,7 +21,7 @@ COL_PTHP       = "PTHP"                      # Optional
 COL_HOURS      = "Hours"                     # numeric
 COL_E_HEAT     = "Electric_savings_Heat_kWhperSF"
 COL_E_COOL     = "electric_savings_Cooling_and_Aux_kWhperSF"
-COL_G_THERM    = "Gas_savings_Heat_therms"
+COL_G_THERM = "Gas_savings_Heat_thermsperSF"
 
 # Optional extras (if present we’ll display)
 COL_BASE_EUI   = "Base_EUI_kBtuperSFperyr"
