@@ -110,25 +110,26 @@ def _map_to_canonical(cols: List[str]) -> Dict[str, str]:
 @st.cache_data(show_spinner=True)
 def load_weather(reload_token: int) -> pd.DataFrame:
     """
-    Robustly read Weather Information with a possibly offset header row.
-    Works with headers like:
-      State | Cities | Heating Degree Days (HDD) | Cooling Degree Days (CDD)
-    and variants such as "City", "HDD", "CDD".
+    Ultra-robust loader for 'Weather Information'.
+    Finds the real header row anywhere in the sheet (handles merged/blank/title rows), and maps headers:
+      State | City/Cities | Heating Degree Days (HDD) | Cooling Degree Days (CDD)
+    to canonical: State, City, HDD, CDD
     """
-    # Read without header so we can detect the real header row
-    raw = pd.read_excel(WORKBOOK_FILENAME, sheet_name=WEATHER_SHEET, header=None)
+    raw = pd.read_excel(WORKBOOK_FILENAME, sheet_name=WEATHER_SHEET, header=None, dtype=str)
+    # Drop fully empty rows/cols
     raw = raw.dropna(how="all").dropna(how="all", axis=1).reset_index(drop=True)
 
-    # Find the most likely header row by matching tokens
-    def norm(s: str) -> str:
-        if s is None: return ""
-        x = str(s).lower()
+    # Normalizer
+    def norm(s):
+        if s is None or (isinstance(s, float) and np.isnan(s)): return ""
+        x = str(s).strip().lower()
         for ch in ["\xa0", " ", "_", "-", ",", ".", "/", "\\", "(", ")", "[", "]", ":", ";"]:
             x = x.replace(ch, "")
         return x
 
-    def header_score(row_vals: list[str]) -> int:
-        tokens = {norm(v) for v in row_vals if str(v).strip() != ""}
+    # Score each row by presence of header tokens
+    def header_score(series):
+        tokens = [norm(v) for v in series.fillna("").tolist()]
         score = 0
         if any(t.startswith("state") for t in tokens): score += 1
         if any(t.startswith("city") or t.startswith("cities") for t in tokens): score += 1
@@ -136,54 +137,71 @@ def load_weather(reload_token: int) -> pd.DataFrame:
         if any(("cooling" in t and "cdd" in t) or t == "cdd" for t in tokens): score += 1
         return score
 
-    best_row, best_score = 0, -1
-    scan_rows = min(25, raw.shape[0])
-    for r in range(scan_rows):
-        vals = raw.iloc[r].fillna("").astype(str).tolist()
-        sc = header_score(vals)
-        if sc > best_score:
-            best_row, best_score = r, sc
+    # Pass 1: look for a row that contains ~3-4 of the tokens
+    scores = raw.apply(header_score, axis=1)
+    if (scores.max() or 0) >= 2:
+        hdr_row = int(scores.idxmax())
+    else:
+        # Pass 2: fallback find row that has both state and city labels
+        hdr_row = None
+        for r in range(min(50, len(raw))):
+            vals = [norm(v) for v in raw.iloc[r].tolist()]
+            if any(v.startswith("state") for v in vals) and (any(v.startswith("city") or v.startswith("cities") for v in vals)):
+                hdr_row = r
+                break
+        if hdr_row is None:
+            hdr_row = 0  # last resort
 
-    # Re-read with detected header row
-    df = pd.read_excel(WORKBOOK_FILENAME, sheet_name=WEATHER_SHEET, header=best_row)
-    df = df.dropna(how="all").dropna(how="all", axis=1)
-    df.columns = [str(c).strip() for c in df.columns]
+    # Build a header -> column index map by scanning detected header row
+    header_vals = [str(v).strip() for v in raw.iloc[hdr_row].tolist()]
+    col_map = {"State": None, "City": None, "HDD": None, "CDD": None}
+    for idx, val in enumerate(header_vals):
+        nv = norm(val)
+        lv = val.lower()
+        if col_map["State"] is None and nv.startswith("state"):
+            col_map["State"] = idx
+        elif col_map["City"] is None and (nv.startswith("city") or nv.startswith("cities")):
+            col_map["City"] = idx
+        elif col_map["HDD"] is None and (("heating" in lv and "hdd" in lv) or nv == "hdd"):
+            col_map["HDD"] = idx
+        elif col_map["CDD"] is None and (("cooling" in lv and "cdd" in lv) or nv == "cdd"):
+            col_map["CDD"] = idx
 
-    # Map to canonical names
-    rename_map = {}
-    for c in df.columns:
-        cl = c.strip().lower()
-        ncl = norm(c)
-        if ncl.startswith("state"):
-            rename_map[c] = "State"
-        elif ncl.startswith("city") or ncl.startswith("cities"):
-            rename_map[c] = "City"
-        elif ("heating" in cl and "hdd" in cl) or ncl == "hdd":
-            rename_map[c] = "HDD"
-        elif ("cooling" in cl and "cdd" in cl) or ncl == "cdd":
-            rename_map[c] = "CDD"
-
-    df = df.rename(columns=rename_map)
-
-    needed = ["State", "City", "HDD", "CDD"]
-    missing = [c for c in needed if c not in df.columns]
+    missing = [k for k, v in col_map.items() if v is None]
     if missing:
         st.error("Weather sheet appears to be missing expected columns.")
-        with st.expander("Show detected Weather headers"):
-            st.write(list(df.columns))
-            st.write(f"Detected header row index: {best_row}")
+        with st.expander("Show detected Weather debug"):
+            st.write("Detected header row index:", hdr_row)
+            st.write("Header row values:", header_vals)
+            st.write("Column map so far:", col_map)
         raise ValueError(f"Weather sheet is missing columns: {', '.join(missing)}")
 
-    # Clean + types
-    df = df[needed].copy()
-    df["State"] = df["State"].astype(str).str.strip()
-    df["City"]  = df["City"].astype(str).str.strip()
-    df["HDD"]   = pd.to_numeric(df["HDD"], errors="coerce").astype("Int64")
-    df["CDD"]   = pd.to_numeric(df["CDD"], errors="coerce").astype("Int64")
+    # Slice the data block underneath the header row
+    data = raw.iloc[hdr_row + 1:].reset_index(drop=True)
 
-    df = df.dropna(subset=["State", "City", "HDD", "CDD"]).drop_duplicates()
-    df = df.sort_values(["State", "City"]).reset_index(drop=True)
-    return df
+    # Extract columns safely (coerce missing to empty string)
+    def safe_col(ix):
+        return data.iloc[:, ix] if (ix is not None and ix < data.shape[1]) else pd.Series([""] * len(data))
+
+    out = pd.DataFrame({
+        "State": safe_col(col_map["State"]),
+        "City":  safe_col(col_map["City"]),
+        "HDD":   safe_col(col_map["HDD"]),
+        "CDD":   safe_col(col_map["CDD"]),
+    })
+
+    # Clean types
+    out["State"] = out["State"].astype(str).str.strip()
+    out["City"]  = out["City"].astype(str).str.strip()
+    out["HDD"]   = pd.to_numeric(out["HDD"], errors="coerce").astype("Int64")
+    out["CDD"]   = pd.to_numeric(out["CDD"], errors="coerce").astype("Int64")
+
+    # Drop blank/incomplete rows, dedupe, sort
+    out = out.dropna(subset=["State", "City", "HDD", "CDD"]).drop_duplicates()
+    out = out[out["State"].astype(str).str.len() > 0]
+    out = out[out["City"].astype(str).str.len() > 0]
+    out = out.sort_values(["State", "City"]).reset_index(drop=True)
+    return out
 
 @st.cache_data(show_spinner=True)
 def load_lookup(reload_token: int) -> pd.DataFrame:
