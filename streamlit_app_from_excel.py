@@ -81,7 +81,7 @@ OPTIONAL_CANONICAL = {
     "htg_load_reduced_BtuhperSF":     ["htg_load_reduced_btuhpersf", "heating load reduced", "htg load reduced"],
 }
 
-def _best_header_row(df_nohdr: pd.DataFrame, scan_rows: int = 20) -> int:
+def _best_header_row(df_nohdr: pd.DataFrame, scan_rows: int = 25) -> int:
     expected_norms = set(sum(EXPECTED_CANONICAL.values(), []))
     best_r, best_hits = 0, -1
     for r in range(min(scan_rows, df_nohdr.shape[0])):
@@ -110,36 +110,77 @@ def _map_to_canonical(cols: List[str]) -> Dict[str, str]:
 @st.cache_data(show_spinner=True)
 def load_weather(reload_token: int) -> pd.DataFrame:
     """
-    Reads tidy Weather Information with headers:
+    Robustly read Weather Information with a possibly offset header row.
+    Works with headers like:
       State | Cities | Heating Degree Days (HDD) | Cooling Degree Days (CDD)
-    Returns canonical: State, City, HDD, CDD
+    and variants such as "City", "HDD", "CDD".
     """
-    df = pd.read_excel(WORKBOOK_FILENAME, sheet_name=WEATHER_SHEET, header=0)
-    # Rename to canonical
+    # Read without header so we can detect the real header row
+    raw = pd.read_excel(WORKBOOK_FILENAME, sheet_name=WEATHER_SHEET, header=None)
+    raw = raw.dropna(how="all").dropna(how="all", axis=1).reset_index(drop=True)
+
+    # Find the most likely header row by matching tokens
+    def norm(s: str) -> str:
+        if s is None: return ""
+        x = str(s).lower()
+        for ch in ["\xa0", " ", "_", "-", ",", ".", "/", "\\", "(", ")", "[", "]", ":", ";"]:
+            x = x.replace(ch, "")
+        return x
+
+    def header_score(row_vals: list[str]) -> int:
+        tokens = {norm(v) for v in row_vals if str(v).strip() != ""}
+        score = 0
+        if any(t.startswith("state") for t in tokens): score += 1
+        if any(t.startswith("city") or t.startswith("cities") for t in tokens): score += 1
+        if any(("heating" in t and "hdd" in t) or t == "hdd" for t in tokens): score += 1
+        if any(("cooling" in t and "cdd" in t) or t == "cdd" for t in tokens): score += 1
+        return score
+
+    best_row, best_score = 0, -1
+    scan_rows = min(25, raw.shape[0])
+    for r in range(scan_rows):
+        vals = raw.iloc[r].fillna("").astype(str).tolist()
+        sc = header_score(vals)
+        if sc > best_score:
+            best_row, best_score = r, sc
+
+    # Re-read with detected header row
+    df = pd.read_excel(WORKBOOK_FILENAME, sheet_name=WEATHER_SHEET, header=best_row)
+    df = df.dropna(how="all").dropna(how="all", axis=1)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Map to canonical names
     rename_map = {}
     for c in df.columns:
-        c_clean = str(c).strip()
-        low = c_clean.lower()
-        if low.startswith("state"):
+        cl = c.strip().lower()
+        ncl = norm(c)
+        if ncl.startswith("state"):
             rename_map[c] = "State"
-        elif low.startswith("cities") or low.startswith("city"):
+        elif ncl.startswith("city") or ncl.startswith("cities"):
             rename_map[c] = "City"
-        elif ("heating" in low and "hdd" in low) or low == "hdd":
+        elif ("heating" in cl and "hdd" in cl) or ncl == "hdd":
             rename_map[c] = "HDD"
-        elif ("cooling" in low and "cdd" in low) or low == "cdd":
+        elif ("cooling" in cl and "cdd" in cl) or ncl == "cdd":
             rename_map[c] = "CDD"
+
     df = df.rename(columns=rename_map)
 
     needed = ["State", "City", "HDD", "CDD"]
     missing = [c for c in needed if c not in df.columns]
     if missing:
+        st.error("Weather sheet appears to be missing expected columns.")
+        with st.expander("Show detected Weather headers"):
+            st.write(list(df.columns))
+            st.write(f"Detected header row index: {best_row}")
         raise ValueError(f"Weather sheet is missing columns: {', '.join(missing)}")
 
+    # Clean + types
     df = df[needed].copy()
     df["State"] = df["State"].astype(str).str.strip()
     df["City"]  = df["City"].astype(str).str.strip()
     df["HDD"]   = pd.to_numeric(df["HDD"], errors="coerce").astype("Int64")
     df["CDD"]   = pd.to_numeric(df["CDD"], errors="coerce").astype("Int64")
+
     df = df.dropna(subset=["State", "City", "HDD", "CDD"]).drop_duplicates()
     df = df.sort_values(["State", "City"]).reset_index(drop=True)
     return df
@@ -150,7 +191,7 @@ def load_lookup(reload_token: int) -> pd.DataFrame:
     df0 = pd.read_excel(WORKBOOK_FILENAME, sheet_name=LOOKUP_SHEET, header=None)
     df0 = df0.dropna(how="all").dropna(how="all", axis=1).reset_index(drop=True)
 
-    hdr_row = _best_header_row(df0, scan_rows=20)
+    hdr_row = _best_header_row(df0, scan_rows=25)
     df = pd.read_excel(WORKBOOK_FILENAME, sheet_name=LOOKUP_SHEET, header=hdr_row)
     df = df.dropna(how="all").dropna(how="all", axis=1)
     df.columns = [str(c).strip() for c in df.columns]
