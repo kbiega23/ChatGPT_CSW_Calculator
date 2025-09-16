@@ -110,63 +110,43 @@ def _map_to_canonical(cols: List[str]) -> Dict[str, str]:
 @st.cache_data(show_spinner=True)
 def load_weather(reload_token: int) -> pd.DataFrame:
     """
-    Parse Weather Information laid out in repeating 4-col blocks:
-    [City, HDD, CDD, State] across columns.
-    Robust to stray header labels and blanks.
+    Reads tidy Weather Information with headers:
+      State | Cities | Heating Degree Days (HDD) | Cooling Degree Days (CDD)
+    Returns canonical: State, City, HDD, CDD
     """
-    ws = pd.read_excel(WORKBOOK_FILENAME, sheet_name=WEATHER_SHEET, header=None)
-    recs = []
-    rows, cols = ws.shape
+    df = pd.read_excel(WORKBOOK_FILENAME, sheet_name=WEATHER_SHEET, header=0)
+    # Rename to canonical
+    rename_map = {}
+    for c in df.columns:
+        c_clean = str(c).strip()
+        low = c_clean.lower()
+        if low.startswith("state"):
+            rename_map[c] = "State"
+        elif low.startswith("cities") or low.startswith("city"):
+            rename_map[c] = "City"
+        elif ("heating" in low and "hdd" in low) or low == "hdd":
+            rename_map[c] = "HDD"
+        elif ("cooling" in low and "cdd" in low) or low == "cdd":
+            rename_map[c] = "CDD"
+    df = df.rename(columns=rename_map)
 
-    def clean_text(x):
-        return str(x).strip() if isinstance(x, str) else x
+    needed = ["State", "City", "HDD", "CDD"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise ValueError(f"Weather sheet is missing columns: {', '.join(missing)}")
 
-    for c0 in range(0, cols, 4):
-        for r in range(rows):
-            city  = ws.iat[r, c0]   if c0 < cols else None
-            hdd   = ws.iat[r, c0+1] if c0+1 < cols else None
-            cdd   = ws.iat[r, c0+2] if c0+2 < cols else None
-            state = ws.iat[r, c0+3] if c0+3 < cols else None
-
-            city  = clean_text(city)
-            state = clean_text(state)
-
-            # skip non-data/header-ish rows
-            if not city or not state:
-                continue
-            low_city  = city.lower() if isinstance(city, str) else ""
-            low_state = state.lower() if isinstance(state, str) else ""
-            if low_city in {"city", "hdd", "cdd", "state"} or low_state in {"city", "hdd", "cdd", "state"}:
-                continue
-
-            # coerce HDD/CDD
-            try:
-                hddv = int(float(hdd))
-                cddv = int(float(cdd))
-            except Exception:
-                continue
-
-            recs.append({
-                "State": state,     # keep your sheet's exact spelling (e.g., full names)
-                "City": city,
-                "HDD": hddv,
-                "CDD": cddv
-            })
-
-    out = pd.DataFrame(recs)
-    if out.empty:
-        return out
-
-    # normalize whitespace & dedupe
-    out["State"] = out["State"].astype(str).str.strip()
-    out["City"]  = out["City"].astype(str).str.strip()
-    out = out.drop_duplicates().sort_values(["State", "City"]).reset_index(drop=True)
-    return out
+    df = df[needed].copy()
+    df["State"] = df["State"].astype(str).str.strip()
+    df["City"]  = df["City"].astype(str).str.strip()
+    df["HDD"]   = pd.to_numeric(df["HDD"], errors="coerce").astype("Int64")
+    df["CDD"]   = pd.to_numeric(df["CDD"], errors="coerce").astype("Int64")
+    df = df.dropna(subset=["State", "City", "HDD", "CDD"]).drop_duplicates()
+    df = df.sort_values(["State", "City"]).reset_index(drop=True)
+    return df
 
 @st.cache_data(show_spinner=True)
 def load_lookup(reload_token: int) -> pd.DataFrame:
     """Robust loader for 'Savings Lookup': auto-detect header row; normalize & map to canonical names."""
-    # read w/out header to detect header row
     df0 = pd.read_excel(WORKBOOK_FILENAME, sheet_name=LOOKUP_SHEET, header=None)
     df0 = df0.dropna(how="all").dropna(how="all", axis=1).reset_index(drop=True)
 
@@ -175,7 +155,6 @@ def load_lookup(reload_token: int) -> pd.DataFrame:
     df = df.dropna(how="all").dropna(how="all", axis=1)
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Map to canonical names if close
     mapping = _map_to_canonical(df.columns.tolist())
     df = df.rename(columns=mapping)
 
@@ -237,30 +216,33 @@ if not st.session_state.lead_saved:
 st.success("Step 1 saved. You can keep editing above — your entries will persist.")
 
 # =========================================================
-# WIZARD — Step 2: Location (auto HDD/CDD) with robust state→city mapping
+# WIZARD — Step 2: Location (auto HDD/CDD)
 # =========================================================
 st.subheader("Step 2 — Location")
-
 if weather_df.empty:
     st.error("Weather table appears empty. Please verify the **Weather Information** sheet layout.")
     st.stop()
 
-states = sorted(weather_df["State"].astype(str).str.strip().unique().tolist())
-# keep selection if still valid
+states = weather_df["State"].astype(str).str.strip().unique().tolist()
+states.sort()
 if st.session_state.state not in states:
     st.session_state.state = states[0] if states else ""
+st.session_state.state = st.selectbox(
+    "State*", states,
+    index=states.index(st.session_state.state) if st.session_state.state in states else 0,
+    key="state_select"
+)
 
-st.session_state.state = st.selectbox("State*", states, index=states.index(st.session_state.state) if st.session_state.state in states else 0, key="state_select")
-
-# now cities for that state
 cities_df = weather_df[weather_df["State"].astype(str).str.strip() == st.session_state.state]
 cities = cities_df["City"].astype(str).str.strip().unique().tolist()
 cities.sort()
-
 if st.session_state.city not in cities:
     st.session_state.city = cities[0] if cities else ""
-
-st.session_state.city = st.selectbox("City*", cities, index=cities.index(st.session_state.city) if st.session_state.city in cities else 0, key="city_select")
+st.session_state.city = st.selectbox(
+    "City*", cities,
+    index=cities.index(st.session_state.city) if st.session_state.city in cities else 0,
+    key="city_select"
+)
 
 sel = cities_df[cities_df["City"].astype(str).str.strip() == st.session_state.city]
 if sel.empty:
@@ -273,7 +255,6 @@ st.info(f"HDD = **{HDD}**, CDD = **{CDD}** (from Weather Information)")
 # WIZARD — Step 3: Building & Systems
 # =========================================================
 st.subheader("Step 3 — Building & Systems")
-
 def uniq(col: str) -> List[str]:
     out = sorted([str(x) for x in lookup_df[col].dropna().unique()])
     return [o for o in out if o.strip()] + [o for o in out if not o.strip()]
@@ -353,7 +334,7 @@ def interpolate_by_hours(sub: pd.DataFrame, target_hours: int, cols: List[str]) 
     tmp = sub[pd.to_numeric(sub["Hours"], errors="coerce").notna()].copy()
     if tmp.empty:
         return sub.iloc[0][cols]
-    tmp["Hours"] = tmp["Hours"].astype(float).sort_values().astype(float)
+    tmp["Hours"] = tmp["Hours"].astype(float)
     tmp = tmp.sort_values("Hours")
 
     exact = tmp[np.isclose(tmp["Hours"], target_hours)]
