@@ -6,7 +6,7 @@ import pandas as pd
 # ----------------------------
 @st.cache_data
 def load_workbook():
-    # Make sure the Excel file is in the repo root
+    # Load Excel file directly from repo root
     return pd.ExcelFile("CSW Savings Calculator 2_0_0_Unlocked.xlsx")
 
 # ----------------------------
@@ -64,7 +64,7 @@ gas_rate = st.number_input("Gas Rate ($/therm)", min_value=0.01, step=0.01)
 st.header("Step 5: Estimated Results")
 
 if st.button("Run Calculation"):
-    # Demo math (replace later with regression from Excel data)
+    # Demo math (replace with regression logic later)
     baseline_energy = floor_area * 10  # fake baseline (kWh)
     savings = baseline_energy * 0.15   # assume 15% savings
     annual_savings = savings * elec_rate
