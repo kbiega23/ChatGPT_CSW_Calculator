@@ -15,23 +15,34 @@ LOOKUP_SHEET  = "Savings Lookup"
 APP_TITLE = "Commercial Secondary Windows (CSW) Savings Calculator"
 st.set_page_config(page_title=APP_TITLE, layout="centered")
 st.title(APP_TITLE)
-st.caption("Excel-driven prototype: reads Weather & Savings Lookup, filters by keys, and linearly interpolates by Hours.")
+st.caption("Excel-driven: reads Weather & Savings Lookup, filters by keys, and linearly interpolates by Hours.")
 
-# --- Safe cache-busting token (no experimental rerun needed)
+# =========================================================
+# SESSION STATE (wizard + cache reload)
+# =========================================================
 if "reload_token" not in st.session_state:
-    st.session_state["reload_token"] = 0
+    st.session_state.reload_token = 0
+if "lead_saved" not in st.session_state:
+    st.session_state.lead_saved = False
 
+# persist form fields
+for k, v in {
+    "project": "", "contact": "", "company": "",
+    "email": "", "phone": "", "notes": "",
+    "state": "", "city": ""
+}.items():
+    st.session_state.setdefault(k, v)
+
+# cache-busting without experimental APIs
 col_reload, _ = st.columns([1, 3])
 with col_reload:
     if st.button("Reload workbook (clear cache)"):
-        st.session_state["reload_token"] += 1
-
+        st.session_state.reload_token += 1
 
 # =========================================================
-# Header normalization / matching helpers
+# Header normalization / matching helpers (for Savings Lookup)
 # =========================================================
 def _norm(s: str) -> str:
-    """Lowercase; remove spaces/underscores/common punctuation/non-breaking space for robust matching."""
     if s is None:
         return ""
     x = str(s).lower()
@@ -62,7 +73,6 @@ EXPECTED_CANONICAL = {
         "gas_savings_heat_therms", "gas_savings_thermspersf", "thermspersf", "therms per sf", "gas therms per sf"
     ],
 }
-
 OPTIONAL_CANONICAL = {
     "Base_EUI_kBtuperSFperyr":        ["base_eui_kbtupersfperyr", "base eui", "baseline eui"],
     "CSW_EUI_kBtuperSFperyr":         ["csw_eui_kbtupersfperyr", "csw eui"],
@@ -72,7 +82,6 @@ OPTIONAL_CANONICAL = {
 }
 
 def _best_header_row(df_nohdr: pd.DataFrame, scan_rows: int = 20) -> int:
-    """Scan top rows to find the most likely header row by matching normalized tokens."""
     expected_norms = set(sum(EXPECTED_CANONICAL.values(), []))
     best_r, best_hits = 0, -1
     for r in range(min(scan_rows, df_nohdr.shape[0])):
@@ -84,7 +93,6 @@ def _best_header_row(df_nohdr: pd.DataFrame, scan_rows: int = 20) -> int:
     return best_r
 
 def _map_to_canonical(cols: List[str]) -> Dict[str, str]:
-    """Map original headers to canonical names (where found)."""
     inv = {}
     for canon, variants in {**EXPECTED_CANONICAL, **OPTIONAL_CANONICAL}.items():
         for v in variants:
@@ -96,32 +104,63 @@ def _map_to_canonical(cols: List[str]) -> Dict[str, str]:
             mapping[c] = inv[n]
     return mapping
 
-
 # =========================================================
-# Loaders (accept reload_token so cache invalidates when you click reload)
+# Loaders (cache keyed by reload_token)
 # =========================================================
 @st.cache_data(show_spinner=True)
 def load_weather(reload_token: int) -> pd.DataFrame:
-    """Parse Weather Information: repeating 4-col blocks [City, HDD, CDD, State]."""
+    """
+    Parse Weather Information laid out in repeating 4-col blocks:
+    [City, HDD, CDD, State] across columns.
+    Robust to stray header labels and blanks.
+    """
     ws = pd.read_excel(WORKBOOK_FILENAME, sheet_name=WEATHER_SHEET, header=None)
     recs = []
     rows, cols = ws.shape
+
+    def clean_text(x):
+        return str(x).strip() if isinstance(x, str) else x
+
     for c0 in range(0, cols, 4):
         for r in range(rows):
             city  = ws.iat[r, c0]   if c0 < cols else None
             hdd   = ws.iat[r, c0+1] if c0+1 < cols else None
             cdd   = ws.iat[r, c0+2] if c0+2 < cols else None
             state = ws.iat[r, c0+3] if c0+3 < cols else None
-            if isinstance(city, str) and isinstance(state, str):
-                if city.strip().lower() == "city" or state.strip().lower() == "state":
-                    continue
-                try:
-                    hddv = int(float(hdd))
-                    cddv = int(float(cdd))
-                except Exception:
-                    continue
-                recs.append({"State": state.strip(), "City": city.strip(), "HDD": hddv, "CDD": cddv})
-    out = pd.DataFrame(recs).drop_duplicates().sort_values(["State", "City"]).reset_index(drop=True)
+
+            city  = clean_text(city)
+            state = clean_text(state)
+
+            # skip non-data/header-ish rows
+            if not city or not state:
+                continue
+            low_city  = city.lower() if isinstance(city, str) else ""
+            low_state = state.lower() if isinstance(state, str) else ""
+            if low_city in {"city", "hdd", "cdd", "state"} or low_state in {"city", "hdd", "cdd", "state"}:
+                continue
+
+            # coerce HDD/CDD
+            try:
+                hddv = int(float(hdd))
+                cddv = int(float(cdd))
+            except Exception:
+                continue
+
+            recs.append({
+                "State": state,     # keep your sheet's exact spelling (e.g., full names)
+                "City": city,
+                "HDD": hddv,
+                "CDD": cddv
+            })
+
+    out = pd.DataFrame(recs)
+    if out.empty:
+        return out
+
+    # normalize whitespace & dedupe
+    out["State"] = out["State"].astype(str).str.strip()
+    out["City"]  = out["City"].astype(str).str.strip()
+    out = out.drop_duplicates().sort_values(["State", "City"]).reset_index(drop=True)
     return out
 
 @st.cache_data(show_spinner=True)
@@ -149,19 +188,19 @@ def load_lookup(reload_token: int) -> pd.DataFrame:
                     df = df.rename(columns={c: canon})
                     break
 
-    # backward-compat: allow the old gas header name
+    # Backward-compat: allow old gas header name
     if "Gas_savings_Heat_thermsperSF" not in df.columns and "Gas_savings_Heat_therms" in df.columns:
         df = df.rename(columns={"Gas_savings_Heat_therms": "Gas_savings_Heat_thermsperSF"})
 
     df = df.dropna(how="all").reset_index(drop=True)
     return df
 
+weather_df = load_weather(st.session_state.reload_token)
+lookup_df  = load_lookup(st.session_state.reload_token)
 
-# Load data (cache keyed by reload_token)
-weather_df = load_weather(st.session_state["reload_token"])
-lookup_df  = load_lookup(st.session_state["reload_token"])
-
-# Required canonical columns
+# =========================================================
+# Required columns check (Lookup)
+# =========================================================
 required_cols = [
     "CSW_Type", "Building_Size", "Building_Type", "HVAC_System_Type", "Fuel_Type", "Hours",
     "Electric_savings_Heat_kWhperSF", "electric_savings_Cooling_and_Aux_kWhperSF", "Gas_savings_Heat_thermsperSF"
@@ -173,35 +212,68 @@ if missing:
         st.write(list(lookup_df.columns))
     st.stop()
 
-
 # =========================================================
-# UI — Lead / Location / Selections
+# WIZARD — Step 1: Project Information (persisted)
 # =========================================================
 st.subheader("Step 1 — Project Information")
-with st.form("lead"):
+with st.form("lead", clear_on_submit=False):
     c1, c2 = st.columns(2)
     with c1:
-        project = st.text_input("Project Name*", "")
-        contact = st.text_input("Contact Name*", "")
-        company = st.text_input("Company", "")
+        st.session_state.project = st.text_input("Project Name*", st.session_state.project, key="project_input")
+        st.session_state.contact = st.text_input("Contact Name*", st.session_state.contact, key="contact_input")
+        st.session_state.company = st.text_input("Company", st.session_state.company, key="company_input")
     with c2:
-        email   = st.text_input("Email*", "")
-        phone   = st.text_input("Phone", "")
-        notes   = st.text_area("Notes")
-    ok = st.form_submit_button("Save & Continue", type="primary")
-if not ok:
+        st.session_state.email   = st.text_input("Email*", st.session_state.email, key="email_input")
+        st.session_state.phone   = st.text_input("Phone", st.session_state.phone, key="phone_input")
+        st.session_state.notes   = st.text_area("Notes", st.session_state.notes, key="notes_input")
+    lead_ok = st.form_submit_button("Save & Continue", type="primary")
+    if lead_ok:
+        st.session_state.lead_saved = True
+
+if not st.session_state.lead_saved:
+    st.info("Fill Step 1 and click **Save & Continue** to proceed.")
     st.stop()
 
+st.success("Step 1 saved. You can keep editing above — your entries will persist.")
+
+# =========================================================
+# WIZARD — Step 2: Location (auto HDD/CDD) with robust state→city mapping
+# =========================================================
 st.subheader("Step 2 — Location")
-states = sorted(weather_df["State"].unique())
-state = st.selectbox("State*", states)
-cities = weather_df.loc[weather_df["State"] == state, "City"].tolist()
-city  = st.selectbox("City*", cities)
-loc = weather_df[(weather_df["State"] == state) & (weather_df["City"] == city)]
-HDD = int(loc["HDD"].iloc[0]); CDD = int(loc["CDD"].iloc[0])
+
+if weather_df.empty:
+    st.error("Weather table appears empty. Please verify the **Weather Information** sheet layout.")
+    st.stop()
+
+states = sorted(weather_df["State"].astype(str).str.strip().unique().tolist())
+# keep selection if still valid
+if st.session_state.state not in states:
+    st.session_state.state = states[0] if states else ""
+
+st.session_state.state = st.selectbox("State*", states, index=states.index(st.session_state.state) if st.session_state.state in states else 0, key="state_select")
+
+# now cities for that state
+cities_df = weather_df[weather_df["State"].astype(str).str.strip() == st.session_state.state]
+cities = cities_df["City"].astype(str).str.strip().unique().tolist()
+cities.sort()
+
+if st.session_state.city not in cities:
+    st.session_state.city = cities[0] if cities else ""
+
+st.session_state.city = st.selectbox("City*", cities, index=cities.index(st.session_state.city) if st.session_state.city in cities else 0, key="city_select")
+
+sel = cities_df[cities_df["City"].astype(str).str.strip() == st.session_state.city]
+if sel.empty:
+    st.error("Selected location not found in Weather Information.")
+    st.stop()
+HDD = int(sel["HDD"].iloc[0]); CDD = int(sel["CDD"].iloc[0])
 st.info(f"HDD = **{HDD}**, CDD = **{CDD}** (from Weather Information)")
 
+# =========================================================
+# WIZARD — Step 3: Building & Systems
+# =========================================================
 st.subheader("Step 3 — Building & Systems")
+
 def uniq(col: str) -> List[str]:
     out = sorted([str(x) for x in lookup_df[col].dropna().unique()])
     return [o for o in out if o.strip()] + [o for o in out if not o.strip()]
@@ -229,7 +301,7 @@ with c5:
 with c6:
     pthp_val = st.selectbox("PTHP", pthp_opts) if pthp_opts else ""
 
-# Hours range from table
+# Hours slider from table
 hrs_series = pd.to_numeric(lookup_df["Hours"], errors="coerce").dropna()
 min_h, max_h = (int(hrs_series.min()), int(hrs_series.max())) if not hrs_series.empty else (1000, 8760)
 
@@ -239,6 +311,9 @@ with c7:
 with c8:
     floor_area = st.number_input("Total Floor Area (ft²)*", min_value=1000, value=10000, step=500)
 
+# =========================================================
+# WIZARD — Step 4: Envelope & Rates
+# =========================================================
 st.subheader("Step 4 — Envelope & Rates")
 c9, c10, c11 = st.columns(3)
 with c9:
@@ -252,7 +327,6 @@ with c12:
     gas_rate = st.number_input("Gas Rate ($/therm)*", min_value=0.0, value=1.10, step=0.01, format="%.2f")
 with c13:
     pass
-
 
 # =========================================================
 # Filtering & Interpolation
@@ -273,15 +347,13 @@ def filter_lookup(df: pd.DataFrame) -> pd.DataFrame:
     )
     if "PTHP" in sub.columns and pthp_val:
         mask = mask & eq("PTHP", pthp_val)
-
-    out = sub[mask].dropna(how="all")
-    return out
+    return sub[mask].dropna(how="all")
 
 def interpolate_by_hours(sub: pd.DataFrame, target_hours: int, cols: List[str]) -> pd.Series:
     tmp = sub[pd.to_numeric(sub["Hours"], errors="coerce").notna()].copy()
     if tmp.empty:
         return sub.iloc[0][cols]
-    tmp["Hours"] = tmp["Hours"].astype(float)
+    tmp["Hours"] = tmp["Hours"].astype(float).sort_values().astype(float)
     tmp = tmp.sort_values("Hours")
 
     exact = tmp[np.isclose(tmp["Hours"], target_hours)]
@@ -308,81 +380,80 @@ def interpolate_by_hours(sub: pd.DataFrame, target_hours: int, cols: List[str]) 
             out[c] = lower[c].iloc[0]
     return pd.Series(out)
 
-
 # =========================================================
 # Calculate
 # =========================================================
+st.subheader("Step 5 — Calculate")
 if st.button("Calculate Savings", type="primary"):
     sub = filter_lookup(lookup_df)
     if sub.empty:
         st.error("No matching rows in Savings Lookup for this combination. Try different selections.")
-        st.stop()
+    else:
+        COLS_INTERP = [
+            "Electric_savings_Heat_kWhperSF",
+            "electric_savings_Cooling_and_Aux_kWhperSF",
+            "Gas_savings_Heat_thermsperSF",
+            "Base_EUI_kBtuperSFperyr",
+            "CSW_EUI_kBtuperSFperyr",
+            "Clg_Load_reduced_BtuhperSF",
+            "htg_load_reduced_BtuhperSF",
+            "baseline_peak_cooling_BtuhperSF",
+        ]
+        cols_to_interp = [c for c in COLS_INTERP if c in sub.columns]
+        vals = interpolate_by_hours(sub, hours, cols_to_interp)
 
-    # Interpolate these columns by Hours (only those that exist)
-    COLS_INTERP = [
-        "Electric_savings_Heat_kWhperSF",
-        "electric_savings_Cooling_and_Aux_kWhperSF",
-        "Gas_savings_Heat_thermsperSF",
-        "Base_EUI_kBtuperSFperyr",
-        "CSW_EUI_kBtuperSFperyr",
-        "Clg_Load_reduced_BtuhperSF",
-        "htg_load_reduced_BtuhperSF",
-        "baseline_peak_cooling_BtuhperSF",
-    ]
-    cols_to_interp = [c for c in COLS_INTERP if c in sub.columns]
-    vals = interpolate_by_hours(sub, hours, cols_to_interp)
+        e_heat   = float(vals.get("Electric_savings_Heat_kWhperSF", 0) or 0.0)
+        e_cool   = float(vals.get("electric_savings_Cooling_and_Aux_kWhperSF", 0) or 0.0)
+        g_therms = float(vals.get("Gas_savings_Heat_thermsperSF", 0) or 0.0)
 
-    e_heat   = float(vals.get("Electric_savings_Heat_kWhperSF", 0) or 0.0)
-    e_cool   = float(vals.get("electric_savings_Cooling_and_Aux_kWhperSF", 0) or 0.0)
-    g_therms = float(vals.get("Gas_savings_Heat_thermsperSF", 0) or 0.0)
+        # per-SF → totals
+        kWh    = (e_heat + e_cool) * csw_area
+        therms = g_therms * csw_area
+        dollars = kWh * elec_rate + therms * gas_rate
 
-    # per-SF → totals
-    kWh    = (e_heat + e_cool) * csw_area
-    therms = g_therms * csw_area
-    dollars = kWh * elec_rate + therms * gas_rate
+        st.success("Estimated Annual Savings")
+        a, b, c = st.columns(3)
+        a.metric("Electric Energy", f"{kWh:,.0f} kWh/yr")
+        b.metric("Gas Energy", f"{therms:,.0f} therms/yr")
+        c.metric("Utility Savings", f"${dollars:,.0f}/yr")
 
-    st.success("Estimated Annual Savings")
-    a, b, c = st.columns(3)
-    a.metric("Electric Energy", f"{kWh:,.0f} kWh/yr")
-    b.metric("Gas Energy", f"{therms:,.0f} therms/yr")
-    c.metric("Utility Savings", f"${dollars:,.0f}/yr")
+        # Optional metrics if present
+        extras = []
+        if "Base_EUI_kBtuperSFperyr" in vals and pd.notnull(vals["Base_EUI_kBtuperSFperyr"]):
+            extras.append(("Baseline EUI", f"{float(vals['Base_EUI_kBtuperSFperyr']):,.2f} kBtu/sf-yr"))
+        if "CSW_EUI_kBtuperSFperyr" in vals and pd.notnull(vals["CSW_EUI_kBtuperSFperyr"]):
+            extras.append(("CSW EUI", f"{float(vals['CSW_EUI_kBtuperSFperyr']):,.2f} kBtu/sf-yr"))
+        if "Clg_Load_reduced_BtuhperSF" in vals and pd.notnull(vals["Clg_Load_reduced_BtuhperSF"]):
+            extras.append(("Cooling Load Reduced", f"{float(vals['Clg_Load_reduced_BtuhperSF']):,.0f} Btuh/sf"))
+        if "htg_load_reduced_BtuhperSF" in vals and pd.notnull(vals["htg_load_reduced_BtuhperSF"]):
+            extras.append(("Heating Load Reduced", f"{float(vals['htg_load_reduced_BtuhperSF']):,.0f} Btuh/sf"))
+        if "baseline_peak_cooling_BtuhperSF" in vals and pd.notnull(vals["baseline_peak_cooling_BtuhperSF"]):
+            extras.append(("Baseline Peak Cooling", f"{float(vals['baseline_peak_cooling_BtuhperSF']):,.0f} Btuh/sf"))
 
-    # Optional metrics if present
-    extras = []
-    if "Base_EUI_kBtuperSFperyr" in vals and pd.notnull(vals["Base_EUI_kBtuperSFperyr"]):
-        extras.append(("Baseline EUI", f"{float(vals['Base_EUI_kBtuperSFperyr']):,.2f} kBtu/sf-yr"))
-    if "CSW_EUI_kBtuperSFperyr" in vals and pd.notnull(vals["CSW_EUI_kBtuperSFperyr"]):
-        extras.append(("CSW EUI", f"{float(vals['CSW_EUI_kBtuperSFperyr']):,.2f} kBtu/sf-yr"))
-    if "Clg_Load_reduced_BtuhperSF" in vals and pd.notnull(vals["Clg_Load_reduced_BtuhperSF"]):
-        extras.append(("Cooling Load Reduced", f"{float(vals['Clg_Load_reduced_BtuhperSF']):,.0f} Btuh/sf"))
-    if "htg_load_reduced_BtuhperSF" in vals and pd.notnull(vals["htg_load_reduced_BtuhperSF"]):
-        extras.append(("Heating Load Reduced", f"{float(vals['htg_load_reduced_BtuhperSF']):,.0f} Btuh/sf"))
-    if "baseline_peak_cooling_BtuhperSF" in vals and pd.notnull(vals["baseline_peak_cooling_BtuhperSF"]):
-        extras.append(("Baseline Peak Cooling", f"{float(vals['baseline_peak_cooling_BtuhperSF']):,.0f} Btuh/sf"))
+        if extras:
+            st.markdown("#### Additional Metrics")
+            for label, value in extras:
+                st.write(f"- **{label}:** {value}")
 
-    if extras:
-        st.markdown("#### Additional Metrics")
-        for label, value in extras:
-            st.write(f"- **{label}:** {value}")
-
-    # Summary
-    st.markdown("#### Project Summary")
-    st.json({
-        "Project": project, "Contact": contact, "Company": company, "Email": email, "Phone": phone,
-        "Location": f"{city}, {state}",
-        "Building Size": building_size, "Building Type": building_type,
-        "HVAC Type": hvac_type, "Fuel Type": fuel_type, "PTHP": pthp_val,
-        "Operating Hours": hours, "Floor Area (sf)": floor_area,
-        "CSW Area (sf)": csw_area, "Elec Rate": elec_rate, "Gas Rate": gas_rate
-    })
-
+        # Summary
+        st.markdown("#### Project Summary")
+        st.json({
+            "Project": st.session_state.project, "Contact": st.session_state.contact,
+            "Company": st.session_state.company, "Email": st.session_state.email, "Phone": st.session_state.phone,
+            "Location": f"{st.session_state.city}, {st.session_state.state}",
+            "Building Size": building_size, "Building Type": building_type,
+            "HVAC Type": hvac_type, "Fuel Type": fuel_type, "PTHP": pthp_val,
+            "Operating Hours": hours, "Floor Area (sf)": floor_area,
+            "CSW Area (sf)": csw_area, "Elec Rate": elec_rate, "Gas Rate": gas_rate
+        })
 
 # =========================================================
 # Debug / Inspect
 # =========================================================
 with st.expander("Debug / Inspect"):
     st.write("Weather rows:", len(weather_df))
-    st.dataframe(weather_df.head(20))
+    st.dataframe(weather_df.head(30))
+    st.write("Unique states:", len(weather_df["State"].unique()))
+    st.write(weather_df.groupby("State")["City"].nunique().sort_values(ascending=False).head(20))
     st.write("Lookup rows:", len(lookup_df))
     st.dataframe(lookup_df.head(20))
-    st.caption("Click 'Reload workbook' after updating the Excel file in GitHub to clear the cache.")
